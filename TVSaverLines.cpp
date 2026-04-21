@@ -1,4 +1,4 @@
-// TVSaverLines.cpp  (v11)
+// TVSaverLines.cpp  (v12)
 // -----------------------------------------------------------------------------
 // Secondary-monitor (TV) burn-in screen-saver
 //
@@ -53,7 +53,7 @@
 // ============================================================================
 static const int LINE_THICKNESS_PCT = 4;
 static const int LINE_THICKNESS_MIN = 15;
-static const int SWEEP_PERIOD_MS    = 4000;
+// SWEEP_PERIOD_MS is now user-configurable (stored in AnimState.sweepPeriodMs)
 static const int FRAME_DELAY_MS     = 16;
 static const int TEST_DURATION_MS   = 12000;
 static const int FADE_MS            = 1500;   // fade-in and fade-out duration
@@ -160,11 +160,12 @@ struct Config {
     bool bothDirs;        // false = L→R only;    true = alternate L↔R each pass
     int  schemaIndex;     // 0 .. kSchemaCount-1
     int  runDurationSec;  // 10 20 30 60 120
+    int  sweepPeriodMs;   // ms per full sweep: 12000 10000 7000 4000 2000
 
     Config()
-        : intervalHours(4), colorIndex(0), singleLine(false),
-          bothDirs(false), schemaIndex(0),
-          runDurationSec(30)
+        : intervalHours(4), colorIndex(0), singleLine(true),
+          bothDirs(true), schemaIndex(0),
+          runDurationSec(30), sweepPeriodMs(7000)
     {}
 };
 
@@ -189,16 +190,18 @@ static Config LoadConfig()
     Config c;
     c.intervalHours  = (int)GetPrivateProfileIntW(L"Settings", L"IntervalHours",   4, ini);
     c.colorIndex     = (int)GetPrivateProfileIntW(L"Settings", L"ColorIndex",       0, ini);
-    c.singleLine     = GetPrivateProfileIntW(L"Settings", L"SingleLine",   0, ini) != 0;
-    c.bothDirs       = GetPrivateProfileIntW(L"Settings", L"BothDirs",     0, ini) != 0;
+    c.singleLine     = GetPrivateProfileIntW(L"Settings", L"SingleLine",   1, ini) != 0;
+    c.bothDirs       = GetPrivateProfileIntW(L"Settings", L"BothDirs",     1, ini) != 0;
     c.schemaIndex    = (int)GetPrivateProfileIntW(L"Settings", L"SchemaIndex",      0, ini);
     c.runDurationSec = (int)GetPrivateProfileIntW(L"Settings", L"RunDurationSec",  30, ini);
+    c.sweepPeriodMs  = (int)GetPrivateProfileIntW(L"Settings", L"SweepPeriodMs", 7000, ini);
 
     if (c.intervalHours < 2 || c.intervalHours > 10 || (c.intervalHours & 1))
         c.intervalHours = 4;
     if (c.colorIndex  < 0 || c.colorIndex  >= kColorCount)  c.colorIndex  = 0;
     if (c.schemaIndex < 0 || c.schemaIndex >= kSchemaCount) c.schemaIndex = 0;
     if (c.runDurationSec < 10 || c.runDurationSec > 300)    c.runDurationSec = 30;
+    if (c.sweepPeriodMs  < 500 || c.sweepPeriodMs > 30000)  c.sweepPeriodMs  = 7000;
     return c;
 }
 
@@ -219,6 +222,8 @@ static void SaveConfig(const Config& c)
     WritePrivateProfileStringW(L"Settings", L"SchemaIndex", buf, ini);
     swprintf_s(buf, L"%d", c.runDurationSec);
     WritePrivateProfileStringW(L"Settings", L"RunDurationSec", buf, ini);
+    swprintf_s(buf, L"%d", c.sweepPeriodMs);
+    WritePrivateProfileStringW(L"Settings", L"SweepPeriodMs", buf, ini);
 }
 
 // ============================================================================
@@ -259,6 +264,7 @@ struct AnimState {
     int      schemaIndex;
     COLORREF hColor;        // color for horizontal line (and V-single)
     int      durationMs;
+    int      sweepPeriodMs;  // ms per full sweep cycle
     DWORD    startTime;
     int      xPos, yPos;
     int      thickH, thickV;
@@ -313,10 +319,10 @@ static LRESULT CALLBACK AnimProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
             // --- Position (with optional bidirectional sweep) ---
             int mw = g_anim.rect.right  - g_anim.rect.left;
             int mh = g_anim.rect.bottom - g_anim.rect.top;
-            float t = (float)(el % SWEEP_PERIOD_MS) / (float)SWEEP_PERIOD_MS;
+            float t = (float)(el % g_anim.sweepPeriodMs) / (float)g_anim.sweepPeriodMs;
 
             // Reverse direction on odd-numbered sweep cycles when bothDirs is set
-            if (g_anim.bothDirs && ((el / (DWORD)SWEEP_PERIOD_MS) % 2 == 1))
+            if (g_anim.bothDirs && ((el / (DWORD)g_anim.sweepPeriodMs) % 2 == 1))
                 t = 1.0f - t;
 
             g_anim.xPos = (int)(t * (float)(mw - g_anim.thickV));
@@ -447,7 +453,8 @@ static int RunAnimation(bool usePrimary, int durationMs, bool testMode, const Co
     g_anim.bothDirs    = c.bothDirs;
     g_anim.schemaIndex = c.schemaIndex;
     g_anim.hColor      = kColors[c.colorIndex].rgb;
-    g_anim.durationMs  = durationMs;
+    g_anim.durationMs    = durationMs;
+    g_anim.sweepPeriodMs = c.sweepPeriodMs;
     g_anim.startTime   = GetTickCount();
     g_anim.xPos        = 0;
     g_anim.yPos        = 0;
@@ -558,6 +565,7 @@ static bool CreateScheduledTask(int hours, HWND parent)
 #define IDC_SAVE       1009
 #define IDC_CANCEL     1010
 #define IDC_DURATION   1011
+#define IDC_SPEED      1012
 
 static HFONT g_hFont = nullptr;
 static int   g_dpi   = 96;
@@ -582,18 +590,22 @@ static void LaunchTestProcess(HWND hWnd)
     int sel   = (int)SendMessageW(GetDlgItem(hWnd, IDC_TESTWHERE), CB_GETCURSEL, 0, 0);
     int clr   = (int)SendMessageW(GetDlgItem(hWnd, IDC_COLOR),     CB_GETCURSEL, 0, 0);
     int sch   = (int)SendMessageW(GetDlgItem(hWnd, IDC_SCHEMA),    CB_GETCURSEL, 0, 0);
+    int spd   = (int)SendMessageW(GetDlgItem(hWnd, IDC_SPEED),     CB_GETCURSEL, 0, 0);
     bool sln  = IsDlgButtonChecked(hWnd, IDC_LINEMODE_SINGLE) == BST_CHECKED;
     bool bdir = IsDlgButtonChecked(hWnd, IDC_BOTHDIRS)        == BST_CHECKED;
     if (clr < 0) clr = 0;
     if (sch < 0) sch = 0;
 
+    static const int spdVals[] = { 12000, 10000, 7000, 4000, 2000 };
+    int spdMs = (spd >= 0 && spd < 5) ? spdVals[spd] : 7000;
+
     wchar_t exe[MAX_PATH];
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
 
     wchar_t args[512];
-    swprintf_s(args, L"/test %d /color %d /schema %d %s%s",
+    swprintf_s(args, L"/test %d /color %d /schema %d /speed %d %s%s",
                (sel == 0) ? 1 : 2,
-               clr, sch,
+               clr, sch, spdMs,
                sln  ? L"/single "  : L"/both ",
                bdir ? L"/bothdirs" : L"");
 
@@ -629,6 +641,12 @@ static LRESULT CALLBACK ConfigProc(HWND hWnd, UINT msg, WPARAM w, LPARAM l)
 
             int durIdx = (int)SendMessageW(GetDlgItem(hWnd, IDC_DURATION), CB_GETCURSEL, 0, 0);
             c.runDurationSec = (durIdx >= 0 && durIdx < 5) ? durVals[durIdx] : 30;
+
+            {
+                static const int spdVals[] = { 12000, 10000, 7000, 4000, 2000 };
+                int spdIdx = (int)SendMessageW(GetDlgItem(hWnd, IDC_SPEED), CB_GETCURSEL, 0, 0);
+                c.sweepPeriodMs = (spdIdx >= 0 && spdIdx < 5) ? spdVals[spdIdx] : 7000;
+            }
 
             // Guard against bad combo-box state
             if (c.intervalHours < 2 || c.intervalHours > 10) c.intervalHours = 4;
@@ -677,12 +695,13 @@ static int ShowConfigDialog(HINSTANCE hInst)
     // Vertical Schema     140      55      205
     // Line Mode           205      98      315   (3 controls inside)
     // Run Duration        315      55      380
-    // Test Preview        380      55      445
-    // Buttons             460
-    // CH                  500
+    // Sweep Speed         380      55      445
+    // Test Preview        445      55      510
+    // Buttons             520
+    // CH                  560
     // ----------------------------------------------------------------
     const int gbX = 14, gbW = 432;
-    const int CW = 460, CH = 500;
+    const int CW = 460, CH = 560;
 
     RECT want = { 0, 0, DS(CW), DS(CH) };
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
@@ -740,16 +759,17 @@ static int ShowConfigDialog(HINSTANCE hInst)
     // --- Line Mode (radio + checkbox) ---
     MakeCtrl(hWnd, L"BUTTON", L"  Line Mode  ", BS_GROUPBOX,
              gbX, y, gbW, 98, -1);
-    MakeCtrl(hWnd, L"BUTTON",
-             L"Both lines  (vertical + horizontal)",
-             BS_AUTORADIOBUTTON|WS_GROUP|WS_TABSTOP,
-             gbX+15, y+20, 390, 20, IDC_LINEMODE_BOTH);
+    // Single line on top (default), Both lines below
     MakeCtrl(hWnd, L"BUTTON",
              L"Vertical line only  (left \u2192 right)",
-             BS_AUTORADIOBUTTON,
-             gbX+15, y+43, 390, 20, IDC_LINEMODE_SINGLE);
+             BS_AUTORADIOBUTTON|WS_GROUP|WS_TABSTOP,
+             gbX+15, y+20, 390, 20, IDC_LINEMODE_SINGLE);
     MakeCtrl(hWnd, L"BUTTON",
-             L"Alternate direction each pass  (left \u2192 right \u2192 left)",
+             L"Both lines  (vertical + horizontal)",
+             BS_AUTORADIOBUTTON,
+             gbX+15, y+43, 390, 20, IDC_LINEMODE_BOTH);
+    MakeCtrl(hWnd, L"BUTTON",
+             L"Alternate direction each pass  (left \u2192 right \u2192 left)  \u2713 Recommended",
              BS_AUTOCHECKBOX|WS_TABSTOP,
              gbX+15, y+70, 390, 20, IDC_BOTHDIRS);
     y += 110;
@@ -767,6 +787,27 @@ static int ShowConfigDialog(HINSTANCE hInst)
                                    L"60 seconds", L"120 seconds" };
         for (int i = 0; i < 5; i++)
             SendMessageW(cbDur, CB_ADDSTRING, 0, (LPARAM)dTxt[i]);
+    }
+    y += 65;
+
+    // --- Sweep Speed ---
+    MakeCtrl(hWnd, L"BUTTON", L"  Sweep Speed  ", BS_GROUPBOX,
+             gbX, y, gbW, 55, -1);
+    MakeCtrl(hWnd, L"STATIC", L"Speed:", SS_LEFT,
+             gbX+15, y+26, 55, 18, -1);
+    HWND cbSpd = MakeCtrl(hWnd, L"COMBOBOX", nullptr,
+             CBS_DROPDOWNLIST|WS_VSCROLL|WS_TABSTOP,
+             gbX+75, y+22, 205, 200, IDC_SPEED);
+    {
+        const wchar_t* sTxt[] = {
+            L"Very Slow  (12 s per sweep)",
+            L"Slow       (10 s per sweep)",
+            L"Normal     ( 7 s per sweep)",
+            L"Fast       ( 4 s per sweep)",
+            L"Very Fast  ( 2 s per sweep)",
+        };
+        for (int i = 0; i < 5; i++)
+            SendMessageW(cbSpd, CB_ADDSTRING, 0, (LPARAM)sTxt[i]);
     }
     y += 65;
 
@@ -810,6 +851,14 @@ static int ShowConfigDialog(HINSTANCE hInst)
         SendMessageW(cbDur, CB_SETCURSEL, durSel, 0);
     }
 
+    {
+        static const int spdVals[] = { 12000, 10000, 7000, 4000, 2000 };
+        int spdSel = 2;   // default: Normal (7000 ms)
+        for (int i = 0; i < 5; i++)
+            if (spdVals[i] == c.sweepPeriodMs) { spdSel = i; break; }
+        SendMessageW(cbSpd, CB_SETCURSEL, spdSel, 0);
+    }
+
     CheckRadioButton(hWnd,
         IDC_LINEMODE_BOTH, IDC_LINEMODE_SINGLE,
         c.singleLine ? IDC_LINEMODE_SINGLE : IDC_LINEMODE_BOTH);
@@ -848,6 +897,7 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
     bool modeSet   = false;
     bool schemaSet = false;
     bool bdirsSet  = false;
+    bool speedSet  = false;
 
     for (int i = 1; i < argc; i++) {
         if (_wcsicmp(argv[i], L"/run") == 0 || _wcsicmp(argv[i], L"-run") == 0) {
@@ -866,6 +916,8 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
             cli.singleLine = false; modeSet  = true;
         } else if (_wcsicmp(argv[i], L"/bothdirs") == 0) {
             cli.bothDirs   = true;  bdirsSet = true;
+        } else if (_wcsicmp(argv[i], L"/speed") == 0 && i + 1 < argc) {
+            cli.sweepPeriodMs = _wtoi(argv[++i]); speedSet = true;
         }
     }
     if (argv) LocalFree(argv);
@@ -890,8 +942,10 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
             c.colorIndex  = cli.colorIndex;
         if (schemaSet && cli.schemaIndex >= 0 && cli.schemaIndex < kSchemaCount)
             c.schemaIndex = cli.schemaIndex;
-        if (modeSet)  c.singleLine = cli.singleLine;
-        if (bdirsSet) c.bothDirs   = cli.bothDirs;
+        if (modeSet)  c.singleLine    = cli.singleLine;
+        if (bdirsSet) c.bothDirs      = cli.bothDirs;
+        if (speedSet && cli.sweepPeriodMs >= 500 && cli.sweepPeriodMs <= 30000)
+            c.sweepPeriodMs = cli.sweepPeriodMs;
         return RunAnimation(mode == M_TEST_MAIN, TEST_DURATION_MS, true, c);
     }
 
